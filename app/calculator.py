@@ -23,6 +23,31 @@ Number = Union[int, float, Decimal]
 CalculationResult = Union[Number, str]
 
 
+class _SafeFileHandler(logging.Handler):
+    """
+    A logging handler that avoids Windows file-lock issues by NOT keeping the
+    log file open. It opens, writes, and closes on every emit.
+    """
+    def __init__(self, path: Path, level=logging.INFO):
+        super().__init__(level=level)
+        self._path = str(path)
+        self.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = self.format(record)
+        try:
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            # Never raise from logging in app flow
+            pass
+
+    def close(self) -> None:
+        # Nothing persistent to close (no open handle)
+        super().close()
+
+
 class Calculator:
     """
     Main calculator class implementing multiple design patterns.
@@ -42,69 +67,58 @@ class Calculator:
                 If not provided, default settings are loaded based on environment variables.
         """
         if config is None:
-            # Determine the project root directory if no configuration is provided
             current_file = Path(__file__)
             project_root = current_file.parent.parent
             config = CalculatorConfig(base_dir=project_root)
 
-        # Assign the configuration and validate its parameters
         self.config = config
         self.config.validate()
 
-        # Ensure that the log directory exists
+        # Ensure directories exist
         os.makedirs(self.config.log_dir, exist_ok=True)
 
-        # Set up the logging system
+        # Set up logging (safe on Windows)
         self._setup_logging()
 
-        # Initialize calculation history and operation strategy
+        # Initialize state
         self.history: List[Calculation] = []
         self.operation_strategy: Optional[Operation] = None
-
-        # Initialize observer list for the Observer pattern
         self.observers: List[HistoryObserver] = []
-
-        # Initialize stacks for undo and redo functionality using the Memento pattern
         self.undo_stack: List[CalculatorMemento] = []
         self.redo_stack: List[CalculatorMemento] = []
 
-        # Create required directories for history management
         self._setup_directories()
 
         try:
-            # Attempt to load existing calculation history from file
             self.load_history()
         except Exception as e:
-            # Log a warning if history could not be loaded
             logging.warning(f"Could not load existing history: {e}")
 
-        # Log the successful initialization of the calculator
         logging.info("Calculator initialized with configuration")
 
     def _setup_logging(self) -> None:
         """
-        Configure the logging system safely for cross-platform use.
-
-        Uses a delayed FileHandler to avoid Windows file-lock issues and
-        ensures all handlers can be explicitly closed.
+        Configure logging so it never holds an open file handle (prevents Windows locks).
+        We attach a per-instance safe handler to the ROOT logger so calls like
+        logging.info(...) in this module still write to the right file without locks.
         """
-        from logging import FileHandler
-
         try:
-            # Ensure the log directory exists
             os.makedirs(self.config.log_dir, exist_ok=True)
             log_file = self.config.log_file.resolve()
 
-            # Create logger for this calculator instance
+            # Root logger setup
+            self._root_logger = logging.getLogger()  # root
+            self._root_logger.setLevel(logging.INFO)
+
+            # Create and add our safe handler (unique per calculator instance)
+            self._safe_handler = _SafeFileHandler(log_file)
+            self._root_logger.addHandler(self._safe_handler)
+
+            # Keep a lightweight namespaced logger too (optional)
             self.logger = logging.getLogger(f"calculator.{id(self)}")
             self.logger.setLevel(logging.INFO)
-            self.logger.propagate = False
-
-            # Use delay=True to prevent immediate file open (fixes Windows lock issues)
-            self._log_handler = FileHandler(log_file, encoding="utf-8", delay=True)
-            formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-            self._log_handler.setFormatter(formatter)
-            self.logger.addHandler(self._log_handler)
+            # No handlers on self.logger; it will propagate to root -> safe handler
+            self.logger.propagate = True
 
             self.logger.info(f"Logging initialized at: {log_file}")
         except Exception as e:
@@ -113,60 +127,52 @@ class Calculator:
 
     def close(self) -> None:
         """
-        Release logging file handles so temporary directories can be deleted safely on Windows.
+        Detach our handler from the root logger (no open file to close, but keeps things tidy).
         """
-        if hasattr(self, "logger"):
-            for h in list(self.logger.handlers):
+        try:
+            if hasattr(self, "_root_logger") and hasattr(self, "_safe_handler"):
                 try:
-                    h.flush()
+                    self._root_logger.removeHandler(self._safe_handler)
                 except Exception:
                     pass
                 try:
-                    h.close()
+                    self._safe_handler.close()
                 except Exception:
                     pass
-                self.logger.removeHandler(h)
+        finally:
+            # Drop references so GC is clear
+            if hasattr(self, "_safe_handler"):
+                self._safe_handler = None  # type: ignore
+            if hasattr(self, "_root_logger"):
+                self._root_logger = None  # type: ignore
 
     def __del__(self):
-        """Ensure file handlers are closed if object is garbage-collected."""
         try:
             self.close()
         except Exception:
             pass
 
     def _setup_directories(self) -> None:
-        """
-        Create required directories.
-
-        Ensures that all necessary directories for history management exist.
-        """
+        """Create required directories for history management."""
         self.config.history_dir.mkdir(parents=True, exist_ok=True)
 
     def add_observer(self, observer: HistoryObserver) -> None:
-        """
-        Register a new observer.
-        """
+        """Register a new observer."""
         self.observers.append(observer)
         logging.info(f"Added observer: {observer.__class__.__name__}")
 
     def remove_observer(self, observer: HistoryObserver) -> None:
-        """
-        Remove an existing observer.
-        """
+        """Remove an existing observer."""
         self.observers.remove(observer)
         logging.info(f"Removed observer: {observer.__class__.__name__}")
 
     def notify_observers(self, calculation: Calculation) -> None:
-        """
-        Notify all observers of a new calculation.
-        """
+        """Notify all observers of a new calculation."""
         for observer in self.observers:
             observer.update(calculation)
 
     def set_operation(self, operation: Operation) -> None:
-        """
-        Set the current operation strategy.
-        """
+        """Set the current operation strategy."""
         self.operation_strategy = operation
         logging.info(f"Set operation: {operation}")
 
@@ -268,9 +274,7 @@ class Calculator:
             raise OperationError(f"Failed to load history: {e}")
 
     def get_history_dataframe(self) -> pd.DataFrame:
-        """
-        Get calculation history as a pandas DataFrame.
-        """
+        """Get calculation history as a pandas DataFrame."""
         return pd.DataFrame([
             {
                 'operation': str(calc.operation),
@@ -283,27 +287,21 @@ class Calculator:
         ])
 
     def show_history(self) -> List[str]:
-        """
-        Get formatted history of calculations.
-        """
+        """Get formatted history of calculations."""
         return [
             f"{calc.operation}({calc.operand1}, {calc.operand2}) = {calc.result}"
             for calc in self.history
         ]
 
     def clear_history(self) -> None:
-        """
-        Clear calculation history.
-        """
+        """Clear calculation history."""
         self.history.clear()
         self.undo_stack.clear()
         self.redo_stack.clear()
         logging.info("History cleared")
 
     def undo(self) -> bool:
-        """
-        Undo the last operation.
-        """
+        """Undo the last operation."""
         if not self.undo_stack:
             return False
         memento = self.undo_stack.pop()
@@ -312,9 +310,7 @@ class Calculator:
         return True
 
     def redo(self) -> bool:
-        """
-        Redo the previously undone operation.
-        """
+        """Redo the previously undone operation."""
         if not self.redo_stack:
             return False
         memento = self.redo_stack.pop()
