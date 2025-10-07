@@ -1,0 +1,7 @@
+[run]
+omit =
+    app/calculator_repl.py
+
+[report]
+show_missing = True
+skip_covered = True
