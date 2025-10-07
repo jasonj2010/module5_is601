@@ -1,0 +1,36 @@
+name: Python application
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Environment (.env for tests if needed)
+      run: |
+        printf "CALCULATOR_MAX_HISTORY_SIZE=100\nCALCULATOR_AUTO_SAVE=true\nCALCULATOR_DEFAULT_ENCODING=utf-8\n" > .env
+
+    - name: Run tests with coverage (fail under threshold)
+      run: |
+        pytest
+
+    - name: Check coverage (belt-and-suspenders)
+      run: |
+        coverage report --fail-under=100
